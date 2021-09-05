@@ -20,13 +20,20 @@ const (
 	// (cache line) on 64-bit machines
 	entriesPerMapBucket = 3
 	// threshold number of linked buckets (chain size) to trigger a
-	// table resize during insertion; thus, each chain holds up to
-	// resizeMapThreshold+1 buckets
-	resizeMapThreshold = 2
+	// table grow attempt during insertion
+	mapOverflowThreshold = 2
+	// load factor for the map growth; map grows once it reaches
+	// more entries than mapGrowFactorNum/mapGrowFactorDen of its base
+	// capacity (entriesPerMapBucket*len)
+	mapGrowFactorNum = 3
+	mapGrowFactorDen = 4
 	// threshold fraction of table occupation to start a table shrinking
-	// when deleting the last entry in a bucket chain
-	mapShrinkThreshold = 16
-	// minimal table size, i.e. number of buckets; thus, minimal map
+	// attempt when deleting the last entry in a bucket chain; map
+	// shrinks once it has less entries than
+	// mapShrinkFactorNum/mapShrinkFactorDen of its base capacity
+	mapShrinkFactorNum = 1
+	mapShrinkFactorDen = 32
+	// minimal table size, i.e. number of buckets; thus, minimal base
 	// capacity can be calculated as entriesPerMapBucket*minMapTableLen
 	minMapTableLen = 32
 	// maximum counter stripes to use; stands for around 8KB of memory
@@ -181,6 +188,7 @@ func (m *Map) doStore(key string, value interface{}, loadIfExists bool) (actual 
 		}
 	}
 	// Write path.
+	triedResize := false
 	hash := maphash64(key)
 	for {
 	store_attempt:
@@ -235,10 +243,11 @@ func (m *Map) doStore(key string, value interface{}, loadIfExists bool) (actual 
 					addSize(table, bidx, 1)
 					return
 				}
-				if chainLen == resizeMapThreshold {
-					// Need to grow the table. Then go for another attempt.
+				if !triedResize && chainLen >= mapOverflowThreshold {
+					// Might need to grow the table. Then go for another attempt.
 					rootb.mu.Unlock()
-					m.resize(table, mapGrowHint)
+					m.tryResize(table, mapGrowHint)
+					triedResize = true
 					goto store_attempt
 				}
 				// Create and append a new bucket.
@@ -273,15 +282,23 @@ func (m *Map) waitForResize() {
 	m.resizeMu.Unlock()
 }
 
-func (m *Map) resize(table *mapTable, hint mapResizeHint) {
-	var shrinkThreshold int64
+func (m *Map) tryResize(table *mapTable, hint mapResizeHint) {
+	var growThreshold, shrinkThreshold int64
 	tableLen := len(table.buckets)
-	// Fast path for shrink attempts.
-	if hint == mapShrinkHint {
-		shrinkThreshold = int64((tableLen * entriesPerMapBucket) / mapShrinkThreshold)
+	// Fast path.
+	switch hint {
+	case mapGrowHint:
+		growThreshold = int64(tableLen*entriesPerMapBucket) * mapGrowFactorNum / mapGrowFactorDen
+		if sumSize(table) < growThreshold {
+			return
+		}
+	case mapShrinkHint:
+		shrinkThreshold = int64(tableLen*entriesPerMapBucket) * mapShrinkFactorNum / mapShrinkFactorDen
 		if tableLen == minMapTableLen || sumSize(table) > shrinkThreshold {
 			return
 		}
+	default:
+		panic(fmt.Sprintf("unexpected resize hint: %d", hint))
 	}
 	// Slow path.
 	if !atomic.CompareAndSwapInt64(&m.resizing, 0, 1) {
@@ -292,31 +309,29 @@ func (m *Map) resize(table *mapTable, hint mapResizeHint) {
 	var newTable *mapTable
 	switch hint {
 	case mapGrowHint:
-		// Grow the table with factor of 2.
-		atomic.AddInt64(&m.totalGrowths, 1)
-		newTable = newMapTable(tableLen << 1)
+		if sumSize(table) >= growThreshold {
+			// Grow the table with factor of 2.
+			atomic.AddInt64(&m.totalGrowths, 1)
+			newTable = newMapTable(tableLen << 1)
+		}
 	case mapShrinkHint:
 		if sumSize(table) <= shrinkThreshold {
 			// Shrink the table with factor of 2.
 			atomic.AddInt64(&m.totalShrinks, 1)
 			newTable = newMapTable(tableLen >> 1)
-		} else {
-			// No need to shrink. Wake up all waiters and give up.
-			m.resizeMu.Lock()
-			atomic.StoreInt64(&m.resizing, 0)
-			m.resizeCond.Broadcast()
-			m.resizeMu.Unlock()
-			return
 		}
 	default:
 		panic(fmt.Sprintf("unexpected resize hint: %d", hint))
 	}
-	for i := 0; i < tableLen; i++ {
-		copied := copyBucket(&table.buckets[i], newTable)
-		addSizeNonAtomic(newTable, uint64(i), copied)
+	if newTable != nil {
+		for i := 0; i < tableLen; i++ {
+			copied := copyBucket(&table.buckets[i], newTable)
+			addSizeNonAtomic(newTable, uint64(i), copied)
+		}
+		// Publish the new table.
+		atomic.StorePointer(&m.table, unsafe.Pointer(newTable))
 	}
-	// Publish the new table and wake up all waiters.
-	atomic.StorePointer(&m.table, unsafe.Pointer(newTable))
+	// Wake up all waiters.
 	m.resizeMu.Lock()
 	atomic.StoreInt64(&m.resizing, 0)
 	m.resizeCond.Broadcast()
@@ -405,9 +420,9 @@ func (m *Map) LoadAndDelete(key string) (value interface{}, loaded bool) {
 						}
 						rootb.mu.Unlock()
 						addSize(table, bidx, -1)
-						// Might need to shrink the table.
 						if leftEmpty {
-							m.resize(table, mapShrinkHint)
+							// Might need to shrink the table.
+							m.tryResize(table, mapShrinkHint)
 						}
 						return derefValue(vp), true
 					}
@@ -458,7 +473,7 @@ func isEmpty(rootb *bucket) bool {
 func (m *Map) Range(f func(key string, value interface{}) bool) {
 	tablep := atomic.LoadPointer(&m.table)
 	table := *(*mapTable)(tablep)
-	bentries := make([]rangeEntry, 0, entriesPerMapBucket*(resizeMapThreshold+1))
+	bentries := make([]rangeEntry, 0, entriesPerMapBucket*(mapOverflowThreshold+1))
 	for i := range table.buckets {
 		copyRangeEntries(&table.buckets[i], &bentries)
 		for j := range bentries {

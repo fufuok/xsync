@@ -256,9 +256,6 @@ func TestMapResize(t *testing.T) {
 	if stats.Size != numEntries {
 		t.Errorf("size was too small: %d", stats.Size)
 	}
-	if stats.Capacity > capacityLimit(stats.TableLen) {
-		t.Errorf("capacity was too large: %d, expected: %d", stats.Capacity, capacityLimit(stats.TableLen))
-	}
 	if stats.TableLen <= MinMapTableLen {
 		t.Errorf("table was too small: %d", stats.TableLen)
 	}
@@ -278,9 +275,6 @@ func TestMapResize(t *testing.T) {
 	if stats.Size > 0 {
 		t.Errorf("zero size was expected: %d", stats.Size)
 	}
-	if stats.Capacity > capacityLimit(stats.TableLen) {
-		t.Errorf("capacity was too large: %d, expected: %d", stats.Capacity, capacityLimit(stats.TableLen))
-	}
 	if stats.TableLen != MinMapTableLen {
 		t.Errorf("table was too large: %d", stats.TableLen)
 	}
@@ -288,10 +282,6 @@ func TestMapResize(t *testing.T) {
 		t.Errorf("non-zero total shrinks expected: %d", stats.TotalShrinks)
 	}
 	stats.Print()
-}
-
-func capacityLimit(tableLen int) int {
-	return tableLen * EntriesPerMapBucket * (ResizeMapThreshold + 1)
 }
 
 func TestMapResize_CounterLenLimit(t *testing.T) {
