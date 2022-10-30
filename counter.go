@@ -59,14 +59,16 @@ func (c *Counter) Add(delta int64) {
 	t, ok := ptokenPool.Get().(*ptoken)
 	if !ok {
 		t = new(ptoken)
+		t.idx = fastrand()
 	}
-	t.idx = fastrand() & c.mask
 	for {
-		stripe := &c.stripes[t.idx]
+		stripe := &c.stripes[t.idx&c.mask]
 		cnt := atomic.LoadInt64(&stripe.c)
 		if atomic.CompareAndSwapInt64(&stripe.c, cnt, cnt+delta) {
 			break
 		}
+		// Give a try with another randomly selected stripe.
+		t.idx = fastrand()
 	}
 	ptokenPool.Put(t)
 }
