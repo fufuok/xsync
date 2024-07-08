@@ -12,7 +12,7 @@ import (
 	"time"
 	"unsafe"
 
-	. "github.com/puzpuzpuz/xsync/v3"
+	. "github.com/fufuok/xsync"
 )
 
 const (
@@ -33,6 +33,11 @@ var benchmarkCases = []struct {
 }
 
 var benchmarkKeys []string
+
+type point struct {
+	x int32
+	y int32
+}
 
 func init() {
 	benchmarkKeys = make([]string, benchmarkNumEntries)
@@ -470,6 +475,37 @@ func TestMapStoreThenLoadAndDelete(t *testing.T) {
 	}
 }
 
+func TestMapStoreThenParallelDelete_DoesNotShrinkBelowMinTableLen(t *testing.T) {
+	const numEntries = 1000
+	m := NewMap()
+	for i := 0; i < numEntries; i++ {
+		m.Store(strconv.Itoa(i), i)
+	}
+
+	cdone := make(chan bool)
+	go func() {
+		for i := 0; i < numEntries; i++ {
+			m.Delete(strconv.Itoa(int(i)))
+		}
+		cdone <- true
+	}()
+	go func() {
+		for i := 0; i < numEntries; i++ {
+			m.Delete(strconv.Itoa(int(i)))
+		}
+		cdone <- true
+	}()
+
+	// Wait for the goroutines to finish.
+	<-cdone
+	<-cdone
+
+	stats := CollectMapStats(m)
+	if stats.RootBuckets != DefaultMinMapTableLen {
+		t.Fatalf("table length was different from the minimum: %d", stats.RootBuckets)
+	}
+}
+
 func sizeBasedOnRange(m *Map) int {
 	size := 0
 	m.Range(func(key string, value interface{}) bool {
@@ -542,10 +578,68 @@ func assertMapCapacity(t *testing.T, m *Map, expectedCap int) {
 }
 
 func TestNewMapPresized(t *testing.T) {
-	assertMapCapacity(t, NewMap(), MinMapTableCap)
+	assertMapCapacity(t, NewMap(), DefaultMinMapTableCap)
 	assertMapCapacity(t, NewMapPresized(1000), 1536)
-	assertMapCapacity(t, NewMapPresized(0), MinMapTableCap)
-	assertMapCapacity(t, NewMapPresized(-1), MinMapTableCap)
+	assertMapCapacity(t, NewMap(WithPresize(1000)), 1536)
+	assertMapCapacity(t, NewMapPresized(0), DefaultMinMapTableCap)
+	assertMapCapacity(t, NewMap(WithPresize(0)), DefaultMinMapTableCap)
+	assertMapCapacity(t, NewMapPresized(-1), DefaultMinMapTableCap)
+	assertMapCapacity(t, NewMap(WithPresize(-1)), DefaultMinMapTableCap)
+}
+
+func TestNewMapPresized_DoesNotShrinkBelowMinTableLen(t *testing.T) {
+	const minTableLen = 1024
+	const numEntries = minTableLen * EntriesPerMapBucket
+	m := NewMap(WithPresize(numEntries))
+	for i := 0; i < numEntries; i++ {
+		m.Store(strconv.Itoa(i), i)
+	}
+
+	stats := CollectMapStats(m)
+	if stats.RootBuckets <= minTableLen {
+		t.Fatalf("table did not grow: %d", stats.RootBuckets)
+	}
+
+	for i := 0; i < numEntries; i++ {
+		m.Delete(strconv.Itoa(int(i)))
+	}
+
+	stats = CollectMapStats(m)
+	if stats.RootBuckets != minTableLen {
+		t.Fatalf("table length was different from the minimum: %d", stats.RootBuckets)
+	}
+}
+
+func TestNewMapGrowOnly_OnlyShrinksOnClear(t *testing.T) {
+	const minTableLen = 128
+	const numEntries = minTableLen * EntriesPerMapBucket
+	m := NewMap(WithPresize(numEntries), WithGrowOnly())
+
+	stats := CollectMapStats(m)
+	initialTableLen := stats.RootBuckets
+
+	for i := 0; i < 2*numEntries; i++ {
+		m.Store(strconv.Itoa(i), i)
+	}
+	stats = CollectMapStats(m)
+	maxTableLen := stats.RootBuckets
+	if maxTableLen <= minTableLen {
+		t.Fatalf("table did not grow: %d", maxTableLen)
+	}
+
+	for i := 0; i < numEntries; i++ {
+		m.Delete(strconv.Itoa(int(i)))
+	}
+	stats = CollectMapStats(m)
+	if stats.RootBuckets != maxTableLen {
+		t.Fatalf("table length was different from the expected: %d", stats.RootBuckets)
+	}
+
+	m.Clear()
+	stats = CollectMapStats(m)
+	if stats.RootBuckets != initialTableLen {
+		t.Fatalf("table length was different from the initial: %d", stats.RootBuckets)
+	}
 }
 
 func TestMapResize(t *testing.T) {
@@ -563,7 +657,7 @@ func TestMapResize(t *testing.T) {
 	if stats.Capacity > expectedCapacity {
 		t.Fatalf("capacity was too large: %d, expected: %d", stats.Capacity, expectedCapacity)
 	}
-	if stats.RootBuckets <= MinMapTableLen {
+	if stats.RootBuckets <= DefaultMinMapTableLen {
 		t.Fatalf("table was too small: %d", stats.RootBuckets)
 	}
 	if stats.TotalGrowths == 0 {
@@ -587,7 +681,7 @@ func TestMapResize(t *testing.T) {
 	if stats.Capacity != expectedCapacity {
 		t.Fatalf("capacity was too large: %d, expected: %d", stats.Capacity, expectedCapacity)
 	}
-	if stats.RootBuckets != MinMapTableLen {
+	if stats.RootBuckets != DefaultMinMapTableLen {
 		t.Fatalf("table was too large: %d", stats.RootBuckets)
 	}
 	if stats.TotalShrinks == 0 {
@@ -665,7 +759,7 @@ func parallelRandResizer(t *testing.T, m *Map, numIters, numEntries int, cdone c
 
 func TestMapParallelResize(t *testing.T) {
 	const numIters = 1_000
-	const numEntries = 2 * EntriesPerMapBucket * MinMapTableLen
+	const numEntries = 2 * EntriesPerMapBucket * DefaultMinMapTableLen
 	m := NewMap()
 	cdone := make(chan bool)
 	go parallelRandResizer(t, m, numIters, numEntries, cdone)
@@ -1163,7 +1257,7 @@ func BenchmarkMapStandard_NoWarmUp(b *testing.B) {
 func BenchmarkMap_WarmUp(b *testing.B) {
 	for _, bc := range benchmarkCases {
 		b.Run(bc.name, func(b *testing.B) {
-			m := NewMapPresized(benchmarkNumEntries)
+			m := NewMap(WithPresize(benchmarkNumEntries))
 			for i := 0; i < benchmarkNumEntries; i++ {
 				m.Store(benchmarkKeyPrefix+strconv.Itoa(i), i)
 			}

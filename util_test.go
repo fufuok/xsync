@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"testing"
 
-	. "github.com/puzpuzpuz/xsync/v3"
+	. "github.com/fufuok/xsync"
 )
 
 func TestNextPowOf2(t *testing.T) {
